@@ -1,6 +1,11 @@
 //! Cache for BLS signatures
+//!
+//! Built on `lru` rather than `cached`: `cached` depends on `web-time`, which
+//! on `wasm32-unknown-unknown` pulls in `js-sys` and with it wasm-bindgen
+//! imports, so a canister linking it could not be installed. `lru` needs
+//! nothing beyond `core` and `hashbrown`.
 
-use cached::{Cached, SizedCache};
+use lru::LruCache;
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[cfg(test)]
@@ -39,7 +44,17 @@ impl SignatureCacheEntry {
 
 /// A cache for BLS signature verification
 pub(crate) struct SignatureCache {
-    cache: parking_lot::Mutex<SizedCache<SignatureCacheEntry, ()>>,
+    cache: parking_lot::Mutex<Inner>,
+}
+
+struct Inner {
+    // Unbounded to `lru`, and held to `max_size` by `insert`: a bounded
+    // `LruCache` allocates its whole table up front, which every user would
+    // pay on first touch whether or not the cache ever fills.
+    entries: LruCache<SignatureCacheEntry, ()>,
+    max_size: usize,
+    hits: u64,
+    misses: u64,
 }
 
 lazy_static::lazy_static! {
@@ -49,29 +64,20 @@ lazy_static::lazy_static! {
 impl SignatureCache {
     /// Specify the size of the global signature cache
     ///
-    /// cached::SizedCache uses approximately 65 bytes of memory
-    /// per entry, so with the currently specified size the cache
-    /// consumes ~ 6.5 MB of RAM.
-    ///
-    /// The derivation for 65 bytes is as follows:
-    /// - [u8; 32] is 32 bytes
-    /// - Option<[u8; 32]> is 33 bytes
-    /// - Option<([u8; 32], ())> is also 33 bytes
-    /// - cached's `ListEntry<T>` contains a T plus two usize elements
-    /// - Due to structure padding `ListEntry<Option<([u8; 32], ())>>` is
-    ///   56 bytes rather than 33+2*8=49 bytes. (By using a 31 byte hash
-    ///   we could save some substantial amount of cache memory.)
-    /// - The other overhead of `SizedCache` is a `hashbrown::RawTable<usize>`,
-    ///   which is estimated to consume 9 bytes per element.
-    /// - This leads to an estimate of 65 bytes per element, plus some
-    ///   fixed overhead.
+    /// Each entry is a 32-byte hash in one of `lru`'s list nodes (the hash
+    /// plus two pointers), with a pointer-sized slot for it in the hash
+    /// table, so with the currently specified size a full cache consumes
+    /// roughly 6 MB of RAM. The table grows as the cache fills.
     pub const SIZE_OF_GLOBAL_CACHE: usize = 100000;
 
     /// Create a new signature cache with the specified maximum size
     pub(super) fn new(max_size: usize) -> Self {
-        let cache = parking_lot::Mutex::<SizedCache<SignatureCacheEntry, ()>>::new(
-            SizedCache::with_size(max_size),
-        );
+        let cache = parking_lot::Mutex::new(Inner {
+            entries: LruCache::unbounded(),
+            max_size,
+            hits: 0,
+            misses: 0,
+        });
         Self { cache }
     }
 
@@ -85,7 +91,13 @@ impl SignatureCache {
     /// Returns true if found, false otherwise
     pub(crate) fn contains(&self, entry: &SignatureCacheEntry) -> bool {
         let mut cache = self.cache.lock();
-        cache.cache_get(entry).is_some()
+        let found = cache.entries.get(entry).is_some();
+        if found {
+            cache.hits += 1;
+        } else {
+            cache.misses += 1;
+        }
+        found
     }
 
     /// Insert a entry into the signature cache
@@ -95,7 +107,10 @@ impl SignatureCache {
     /// been verified to be valid.
     pub(crate) fn insert(&self, entry: &SignatureCacheEntry) {
         let mut cache = self.cache.lock();
-        cache.cache_set(*entry, ());
+        cache.entries.put(*entry, ());
+        while cache.entries.len() > cache.max_size {
+            cache.entries.pop_lru();
+        }
     }
 
     /// Return statistics about the cache
@@ -106,10 +121,6 @@ impl SignatureCache {
     pub(crate) fn cache_statistics(&self) -> SignatureCacheStatistics {
         let cache = self.cache.lock();
 
-        let cache_size = cache.cache_size();
-        let hits = cache.cache_hits().unwrap_or(0);
-        let misses = cache.cache_misses().unwrap_or(0);
-
-        SignatureCacheStatistics::new(cache_size, hits, misses)
+        SignatureCacheStatistics::new(cache.entries.len(), cache.hits, cache.misses)
     }
 }
